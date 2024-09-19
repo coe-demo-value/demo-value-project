@@ -1,0 +1,113 @@
+name: Deploy Azure with Gitops-Kustomize
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_tag:
+        description: "Docker TAG"
+        required: true
+        default: "main"
+ 
+env:
+  GIT_OPS_NAME: coe-demo-value-ops  # OPS Repository에 맞게 수정
+  OPS_DIR: charts/${{ github.event.repository.name }}  # 폴더 구조에 맞게 수정
+   
+jobs:
+  ecr-build-push-and-deploy:
+    name: azr-build-push-and-deploy
+    runs-on: ubuntu-latest
+    environment: production
+ 
+    steps:
+    - name: Check out the repo
+      uses: actions/checkout@v4
+       
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Grant execute permission for Gradle wrapper
+      run: chmod +x ./gradlew
+
+    - name: Cache Gradle dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-
+
+    - name: Build Java application using Gradle
+      run: ./gradlew build
+      
+    - name: Log in to Docker Hub
+      uses: azure/docker-login@v2
+      with:
+        login-server: ${{ secrets.AZURE_URL }}
+        username: ${{ secrets.ACR_USERNAME }}
+        password: ${{ secrets.ACR_PASSWORD }}
+       
+    - name: Set Timezone
+      uses: szenius/set-timezone@v2.0
+      with:
+        # Desired timezone for Linux
+        timezoneLinux: Asia/Seoul
+         
+    - name: set env  # TAG 를 현재 시간으로 설정
+      run: echo "NOW=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_ENV
+       
+    - name: Extract metadata (tags, labels) for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ github.repository }}
+        tags: ${{ env.NOW }} # ${{ github.event.inputs.name }}
+   
+    - name: Build and Push to ACR
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        push: true
+        file: ./Dockerfile
+        platforms: linux/amd64
+        tags: ${{ secrets.AZURE_URL }}/${{ steps.meta.outputs.tags }}
+           
+    # kustomize 명령을 가져온다.
+    - name: Setup Kustomize
+      uses: imranismail/setup-kustomize@v1
+ 
+    - name: Checkout kustomize repository
+      uses: actions/checkout@v4
+      with:
+        # kubernetes 설정정보 저장소
+        repository: ${{ github.repository_owner }}/${{ env.GIT_OPS_NAME }}
+        ref: main
+        # 다른 저장소에 push 하려면 Personal Access Token이 필요.
+        token: ${{ secrets.ACTION_TOKEN }} # ${{ secrets.GITHUB_TOKEN }} 
+        path: ${{ env.GIT_OPS_NAME }}
+         
+    # 새 이미지 버전으로 파일 수정
+    - name: Update Kubernetes resources
+      run: |
+        pwd
+        cd ${{ env.GIT_OPS_NAME }}/${{ env.OPS_DIR }}
+        kustomize edit set image ${{ secrets.AZURE_URL }}/${{ steps.meta.outputs.tags }}
+        cat kustomization.yaml
+ 
+    # 수정된 파일 commit & push
+    - name: Commit minifest files
+      run: |
+        cd ${{ env.GIT_OPS_NAME }}/${{ env.OPS_DIR }}
+        git checkout HEAD
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git commit -am 'update image tag  ${{ env.NOW }} from Github Action'
+        cat kustomization.yaml
+        git push origin HEAD
